@@ -1,0 +1,100 @@
+[project]
+name = "fc-ai-pd12m"
+version = "0.0.1"
+description = "A repo forworking with PD12M"
+authors = [{ name = "Daniel Verdu", email = "dverdu@freepik.com" }]
+readme = "README.md"
+keywords = ['python']
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "polars",
+    "boto3",
+    "fsspec",
+    "s3fs",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "pre-commit",
+    "uv",
+    "twine",
+    "bump2version",
+    "ipykernel",
+    "matplotlib",
+    "keyring",
+    "keyrings.google-artifactregistry-auth",
+]
+
+# Add scripts here
+# [project.scripts]
+# script-name = "command:script"
+
+[build-system]
+requires = [
+    "setuptools>=45",
+    "setuptools_scm[toml]>=6.2",
+    "torch",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 120
+# indent-width = 4
+
+# Ignore jupyter notebooks and pyi files.
+extend-exclude = ["*.ipynb", "*.pyi", "src/fc_ai_pd12m/__init__.py"]
+
+# Assume Python 3.11.
+target-version = "py311"
+
+[tool.ruff.lint]
+# Enable pycodestyle ('E'), pyflakes ('F'), isort ('I'), and more.
+select = ["B", "C", "E", "F", "I", "W", "ARG", "SIM", "TCH", "RUF"]
+
+ignore = [
+    # Refers to the max-line length. Let's suppress the error and simply
+    # let black take care on how it wants to format the lines.
+    "E501",
+    # Unnecessary dict call - rewrite as a literal
+    "C408",
+    # Allow whitespace before ':'
+    "E203",
+]
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.mccabe]
+# Flag errors (`C901`) whenever the complexity level exceeds 5.
+max-complexity = 18
+
+[tool.ruff.lint.isort]
+known-first-party = ["fc_ai_pd12m"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version = "0.0.1"
+update_changelog_on_bump = true
+version_files = [
+    "src/fc_ai_pd12m/__version__.py:__version__",
+    "pyproject.toml:version",
+]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.setuptools]
+packages = ["fc_ai_pd12m"]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.pytest.ini_options]
+addopts = "--cov=fc_ai_pd12m"
+testpaths = ["tests"]

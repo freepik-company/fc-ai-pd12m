@@ -1,0 +1,161 @@
+apiVersion: "1.1.0"
+namespace: ai-python-libraries
+createNamespace: true
+customLabels: "smc.jarvis-github-token=true"
+
+alias: &image-alias
+  image: europe-west1-docker.pkg.dev/fc-shared/common/pipeline-slack-notifications:0.1.11
+
+github-status-alias: &github-status-alias
+  description: curl for set inprogress status build on github
+  <<: *image-alias
+  burnupEnabled: "false"
+  burndownEnabled: "false"
+  params:
+    - name: pipelineName
+      value: $(context.pipelineRun.name)
+    - name: pipelineNamespace
+      value: $(context.pipelineRun.namespace)
+  env:
+    - name: JARVIS_GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          key: jarvis-github-token
+          name: jarvis-github-token
+
+install-dependencies-and-run-tests-alias: &install-dependencies-and-run-tests-alias
+  image: python:3.11-bullseye
+  results:
+    - timestamp
+  script: |
+    apt-get update && apt-get install -y libgl1-mesa-glx
+    cd /fc/workspace-data
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    . $HOME/.cargo/env
+    uv venv
+    . .venv/bin/activate
+    make setup-dev
+    make test
+    pre-commit run --all-files
+    make mypy
+
+configuration:
+  gitCredentialsSecret: github-credentials
+  tektonDashboardURL: https://tekton.cdnpk.net
+  sendmailSender: jarvis@freepik.com
+  nodeSelector:
+    machine_type: n2d-standard-4
+  tolerations:
+    - key: "type"
+      operator: "Equal"
+      value: "pipelines"
+      effect: "NoSchedule"
+
+pipelines:
+  #
+  # Push to branch
+  #
+  branches:
+    - name: ci
+      regex: ^.*$
+      serviceAccount: ai-python-libraries
+      nextPipeline: {}
+      steps:
+        - name: status-pr-initial
+          <<: *github-status-alias
+          script: |
+            #!/bin/sh
+            curl -L -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $JARVIS_GITHUB_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/freepik-company/fc-ai-pd12m/statuses/$(params.commit) \
+            -d '{"state":"pending","target_url":"https://pipelines.fpkmon.com/#/namespaces/$(params.pipelineNamespace)/pipelineruns/$(params.pipelineName)","description":"Build In progress: for commit $(params.commit)","context":"tekton-integration-pr/full-pipeline"}'
+
+        - name: install-dependencies-and-run-tests
+          <<: *install-dependencies-and-run-tests-alias
+
+        - name: commitizen
+          description: "Generate version tag"
+          image: europe-west1-docker.pkg.dev/fc-shared/common/commitizen:latest
+          burndownEnabled: "false"
+          results:
+            - version
+          script: |
+            #!/usr/bin/env sh
+            set -ex
+
+            # Only proceed if branch is master or main
+            if [ "$(params.branch)" != "master" ] && [ "$(params.branch)" != "main" ]; then
+              echo "Skipping commitizen as branch is not master or main"
+              exit 0
+            fi
+
+            cp -R "/fc/git-credentials" /root/.ssh
+            chmod 700 /root/.ssh
+            chmod -R 400 /root/.ssh/*
+
+            git config user.email "$(params.email)"
+            git config user.name "$(params.author)"
+
+            # Unshallow required to get all the history
+            git fetch --unshallow
+            git fetch --all --tags
+            if cz bump --changelog --annotated-tag --yes; then
+                git push --atomic origin $(cz version -p) $(params.branch)
+                cat pyproject.toml | grep "version = " | awk '{ print $3 }' | cut -d',' -f1 | tr -d '"' | head -n1 | tr -d '\n' | tee $(results.version.path)
+            else
+              echo "If this is not expected, did you forget to tag commits with feat/fix/...?"
+            fi
+
+      finishSteps:
+        - name: status-pr-success
+          condition: "success"
+          <<: *github-status-alias
+          script: |
+            #!/bin/sh
+            curl -L -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $JARVIS_GITHUB_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/freepik-company/fc-ai-pd12m/statuses/$(params.commit) \
+            -d '{"state":"success","target_url":"https://pipelines.fpkmon.com/#/namespaces/$(params.pipelineNamespace)/pipelineruns/$(params.pipelineName)","description":"CI success: for commit $(params.commit)","context":"tekton-integration-pr/full-pipeline"}'
+
+        - name: status-pr-failed
+          condition: "failed"
+          <<: *github-status-alias
+          script: |
+            #!/bin/sh
+            curl -L -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $JARVIS_GITHUB_TOKEN" -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/freepik-company/fc-ai-pd12m/statuses/$(params.commit) \
+            -d '{"state":"failure","target_url":"https://pipelines.fpkmon.com/#/namespaces/$(params.pipelineNamespace)/pipelineruns/$(params.pipelineName)","description":"CI Failure: for commit $(params.commit)","context":"tekton-integration-pr/full-pipeline"}'
+
+  #
+  # Push to tag
+  #
+  tags:
+    - name: release
+      regex: ^*$
+      serviceAccount: ai-python-libraries
+      nextPipeline: {}
+      steps:
+        - name: install-dependencies-and-run-tests
+          <<: *install-dependencies-and-run-tests-alias
+
+        - name: autocompile-ai-data
+          description: Compile python library
+          image: python:latest
+          runAfter:
+            - install-dependencies-and-run-tests
+          script: |
+            #!/usr/bin/env sh
+            set -ex
+            cd /fc/workspace-data
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            . $HOME/.cargo/env
+            uv venv
+            . .venv/bin/activate
+            uv pip install twine
+            uv pip install keyrings.google-artifactregistry-auth wheel
+            uv build --keyring-provider subprocess --extra-index-url https://oauth2accesstoken@europe-west1-python.pkg.dev/fc-shared/python/simple/
+            python -m twine upload dist/* --skip-existing --repository-url https://europe-west1-python.pkg.dev/fc-shared/python/
