@@ -201,7 +201,7 @@ def process_parquet(
     s3_fs: Optional[s3fs.S3FileSystem],
     s3_storage_options: Optional[dict],
     opts: argparse.Namespace,
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, float]:
     """
     Process a single parquet file
     """
@@ -242,9 +242,6 @@ def process_parquet(
 
     elapsed_time = time.time() - start_time
     avg_time_per_image = elapsed_time / len(image_dimensions)
-    print(
-        f"Processed {parquet_file} in {elapsed_time:.2f} seconds. Average time per image: {avg_time_per_image:.2f} seconds"
-    )
 
     # Add dimensions to dataframe
     pd_df["dimensions"] = image_dimensions
@@ -256,7 +253,7 @@ def process_parquet(
     pd_df = pd_df.drop("dimensions", axis=1)
 
     # Convert back to polars
-    return pl.from_pandas(pd_df)
+    return pl.from_pandas(pd_df), avg_time_per_image
 
 
 def create_global_polars(
@@ -283,11 +280,17 @@ def create_global_polars(
     # Process parquet files
     total_df = pl.DataFrame()
 
-    for parquet_file in tqdm(parquet_files, desc="Processing parquet files", position=0, leave=True):
-        df = process_parquet(parquet_file, s3_fs, s3_storage_options, opts)
+    pbar = tqdm(
+        parquet_files,
+        desc="Processing parquet files (avg time/img: N/A)",
+        position=0,
+        leave=True,
+    )
+    for parquet_file in pbar:
+        df, avg_time_per_image = process_parquet(parquet_file, s3_fs, s3_storage_options, opts)
         if len(df) > 0:
             total_df = pl.concat([total_df, df])
-    print(f"Total rows: {total_df.height}")
+        pbar.set_description(f"Processing parquet files (avg time/img: {avg_time_per_image:.3f}s)")
 
     # Write the DataFrame to a feather file
     try:
