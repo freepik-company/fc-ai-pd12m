@@ -236,7 +236,7 @@ def process_parquet(
             executor.submit(get_image_dimensions, image_path, opts.input_folder, s3_fs) for image_path in image_paths
         ]
         image_dimensions = []
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images", position=1, leave=True):
             if future.result():
                 image_dimensions.append(future.result())
 
@@ -282,7 +282,8 @@ def create_global_polars(
 
     # Process parquet files
     total_df = pl.DataFrame()
-    for parquet_file in parquet_files:
+
+    for parquet_file in tqdm(parquet_files, desc="Processing parquet files", position=0, leave=True):
         df = process_parquet(parquet_file, s3_fs, s3_storage_options, opts)
         if len(df) > 0:
             total_df = pl.concat([total_df, df])
