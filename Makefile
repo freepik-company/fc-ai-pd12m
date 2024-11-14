@@ -9,7 +9,7 @@ setup-dev:  ## Setup dev environment (deps, commit hooks)
 	# Install keyring provider
 	uv pip install keyring keyrings.google-artifactregistry-auth
 	# Install development dependencies and itself for in-place edition
-	uv sync --extra dev --keyring-provider subprocess --extra-index-url https://oauth2accesstoken@europe-west1-python.pkg.dev/fc-shared/python/simple/
+	uv sync --extra dev
 	# Git hooks for flake8, black, and isort (see .pre-commit-config.yaml)
 	pre-commit install
 

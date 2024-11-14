@@ -1,5 +1,8 @@
 .python-version
 
+# Folder
+output/
+
 # S3 credentials
 .aws/
 .env
@@ -22,6 +25,9 @@ __pycache__/
 
 # C extensions
 *.so
+
+# Caches
+*_cache/
 
 # Distribution / packaging
 .Python

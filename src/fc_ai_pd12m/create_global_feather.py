@@ -1,230 +1,336 @@
 import argparse
-import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
+import math
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Optional
 
-import orjson  # Faster JSON parser
+import boto3
 import polars as pl
-from fc_ai_yepop.utils import safe_write_ipc
+import s3fs
 from PIL import Image
-from tqdm import tqdm
+
+from fc_ai_pd12m.utils import safe_write_ipc
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Create a global feather file from yepop dataset")
-    parser.add_argument("--input_folder", type=Path, help="Path to the input folder containing JSON files")
+    parser = argparse.ArgumentParser(description="Create a global feather file from pd12m dataset")
+
+    # Filepath arguments
     parser.add_argument(
-        "--output_file",
-        type=Path,
-        default=Path("global_yepop_data.feather"),
-        help="Path to the output feather file",
-    )
-    parser.add_argument("--batch_size", type=int, default=1000, help="Number of files to process at a time")
-    parser.add_argument(
-        "--ignore_keys",
+        "--input_folder",
         type=str,
-        nargs="+",
-        default=[],
-        help="Keys to ignore in the JSON files",
+        help="Path to the input folder containing parquet files. It can be a local path or a S3 path. If it is a S3 path, include s3:// and the bucket name on it",
     )
     parser.add_argument(
-        "--skip_existing",
-        action="store_true",
-        help="Skip existing files",
-    )
-    parser.add_argument(
-        "--max_workers",
-        type=int,
-        default=None,
-        help="Number of worker threads for parallel processing",
-    )
-    parser.add_argument(
-        "--image_path_key",
+        "--output_path",
         type=str,
-        default="filename",
-        help="Key in the JSON file that contains the image path",
+        default="global_pd12m_data.feather",
+        help="Path to the output feather file. It can be a local path or a S3 path. If it is a S3 path, include s3:// and the bucket name on it",
     )
+
+    # Image arguments
+    parser.add_argument(
+        "--image_path_column",
+        type=str,
+        default="image_path",
+        help="Name of the column that contains the image path",
+    )
+    parser.add_argument(
+        "--image_extension",
+        type=str,
+        default=".jpg",
+        help="Image extension. Please include the dot",
+    )
+
+    # Processing arguments
+    # parser.add_argument(
+    #     "--skip_existing",
+    #     action="store_true",
+    #     help="Skip existing files",
+    # )
     parser.add_argument(
         "--max_items",
         type=int,
         default=None,
         help="Maximum number of items to process",
     )
+
+    # S3 arguments
+    parser.add_argument(
+        "--aws_region",
+        type=str,
+        default="gra",
+        help="AWS region. Only used if --is_s3_folder is set",
+    )
+    parser.add_argument(
+        "--aws_endpoint_url",
+        type=str,
+        default="https://s3.gra.io.cloud.ovh.net",
+        help="AWS endpoint URL. Only used if --is_s3_folder is set",
+    )
     return parser.parse_args()
 
 
 def validate_args(opts: argparse.Namespace) -> argparse.Namespace:
-    if not opts.input_folder.exists():
-        raise ValueError(f"Input folder {opts.input_folder} does not exist")
-    if not opts.output_file.exists():
-        opts.output_file.parent.mkdir(parents=True, exist_ok=True)
-    if opts.output_file.suffix.lower() not in [".feather", ".fth"]:
-        raise ValueError(f"Output file {opts.output_file} must have a .feather or .fth extension")
+    # Check that input folder exists
+    if "s3://" in opts.input_folder:
+        # TODO: fs.exists check fails with directories
+        # if not s3_fs.exists(opts.input_folder):
+        #     raise ValueError(f"Input folder {opts.input_folder} does not exist")
+        pass
+    else:
+        if not Path(opts.input_folder).exists():
+            raise ValueError(f"Input folder {opts.input_folder} does not exist")
+
+    # Check that output file parent folder exists
+    if "s3://" in opts.output_path:
+        # TODO: fs.exists check fails with directories
+        # if not s3_fs.exists(Path(opts.output_path).parent):
+        #     raise ValueError(f"Output folder {Path(opts.output_path).parent} does not exist")
+        pass
+    else:
+        if not Path(opts.output_path).parent.exists():
+            Path(opts.output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Check that output file has a valid extension
+    if Path(opts.output_path).suffix.lower() not in [".feather", ".fth"]:
+        raise ValueError(f"Output file {opts.output_path} must have a .feather or .fth extension")
+
+    # Check that max items is greater than 0
     if opts.max_items is not None and opts.max_items < 1:
         raise ValueError(f"Max items {opts.max_items} must be greater than 0")
+
     return opts
 
 
-def read_files(
-    input_folder: Path,
-    output_file: Path,
-    skip_existing: bool = False,
-) -> list[Path]:
-    json_files = list(input_folder.rglob("*.json"))
-    if len(json_files) == 0:
-        raise ValueError(f"No JSON files found in {input_folder}")
-
-    # Read polars file if it exists
-    if skip_existing and output_file.exists():
-        orig_df = pl.read_ipc(output_file)
-
-        # Skip files that are already in the polars file
-        json_files = [file for file in json_files if file not in orig_df["file_path"].to_list()]
-        if len(json_files) == 0:
-            print(f"All {len(json_files)} files already in the polars file")
-            return []
-
-    return json_files
-
-
-@lru_cache(maxsize=10000)
-def get_image_dimensions(image_path: str) -> tuple:
+def get_ovh_s3_filesystem(opts: argparse.Namespace) -> tuple[s3fs.S3FileSystem, dict]:
+    # Initialize boto3 S3 client
     try:
-        with Image.open(image_path) as img:
-            return img.width, img.height
+        session = boto3.session.Session(profile_name="default")
+        credentials = session.get_credentials().get_frozen_credentials()
+    except Exception as e:
+        raise ValueError(f"Error authenticating with OVH S3: {e}")  # noqa: B904
+
+    s3 = s3fs.S3FileSystem(
+        key=credentials.access_key,
+        secret=credentials.secret_key,
+        endpoint_url=opts.aws_endpoint_url,
+    )
+    s3_storage_options = {
+        "aws_access_key_id": credentials.access_key,
+        "aws_secret_access_key": credentials.secret_key,
+        "endpoint_url": opts.aws_endpoint_url,
+        "aws_region": opts.aws_region,
+    }
+
+    return s3, s3_storage_options
+
+
+def w_pbar(pbar, func):
+    def foo(*args, **kwargs):
+        pbar.update(1)
+        return func(*args, **kwargs)
+
+    return foo
+
+
+def read_dataframe_from_parquet_files(
+    ds_folder: str,
+    s3_fs: Optional[s3fs.S3FileSystem],
+    s3_storage_options: Optional[dict],
+    max_items: Optional[int] = None,
+) -> pl.DataFrame:
+    # For S3
+    if "s3://" in ds_folder:
+        if s3_fs is not None:
+            parquet_files = list(s3_fs.glob(ds_folder + "/*.parquet"))
+            parquet_files = [f"s3://{file}" for file in parquet_files if s3_fs.exists(file)]
+        else:
+            raise ValueError("s3_fs is None, but an S3 path was provided.")
+    else:
+        parquet_files = list(Path(ds_folder).glob("*.parquet"))
+
+    if len(parquet_files) == 0:
+        raise ValueError(f"No parquet files found in {ds_folder}")
+    print(f"Found {len(parquet_files)} parquet files in {ds_folder}")
+
+    # Open first one to get the schema
+    df = pl.read_parquet(parquet_files[0], storage_options=s3_storage_options)
+    df_schema = df.schema
+    parquet_size = df.height
+    del df
+
+    # # To know the total number of rows, open last parquet file and get the number of rows
+    # last_df = pl.read_parquet(parquet_files[-1], storage_options=s3_storage_options)
+    # last_parquet_size = last_df.height
+    # del last_df
+
+    # # Get total number of rows
+    # total_rows = parquet_size * (len(parquet_files) - 1) + last_parquet_size
+
+    # Calculate how many parquet files to read
+    if max_items is not None:
+        num_parquet_files = min(math.ceil(max_items / parquet_size), len(parquet_files))
+    else:
+        num_parquet_files = len(parquet_files)
+
+    # TODO: Randomly select parquet files to read without opening all of them
+    parquet_files_to_read = parquet_files[:num_parquet_files]
+
+    # Read polars
+    df = pl.concat(
+        [
+            pl.read_parquet(
+                file,
+                schema=df_schema,
+                allow_missing_columns=True,
+                storage_options=s3_storage_options,
+            )
+            for file in parquet_files_to_read
+        ]
+    )
+
+    # If max items is set, slice the dataframe
+    if max_items is not None and len(df) > max_items:
+        df = df.slice(0, max_items)
+
+    return df
+
+
+def get_image_path_from_id(
+    item_id: str,
+    ds_folder: str,
+    image_extension: str = ".jpg",
+) -> str:
+    return f"{ds_folder}/{item_id[:5]}/{item_id}{image_extension}"
+
+
+def get_image_dimensions(image_path: str, image_folder: str, s3_fs: Optional[s3fs.S3FileSystem]) -> dict:
+    """
+    Get image dimensions and aspect ratio
+
+    Args:
+        image_path (str): Path to the image
+        image_folder (str): Folder containing the images
+        s3_fs (s3fs.S3FileSystem): S3 filesystem
+
+    Returns:
+        dict: Image width, image height, and aspect ratio
+    """
+
+    if image_path is None:
+        return {"width": None, "height": None, "ar": None}
+
+    abs_image_path = f"{image_folder}/{image_path}"
+    img = None
+    try:
+        if "s3://" in abs_image_path:
+            if s3_fs is not None:
+                with s3_fs.open(abs_image_path, "rb") as f:
+                    img = Image.open(f)
+        else:
+            img = Image.open(abs_image_path)
     except Exception as e:
         print(f"Error getting image dimensions for {image_path}: {e}")
-        return None, None
+        return {"width": None, "height": None, "ar": None}
+
+    if img is not None:
+        width, height = img.width, img.height
+        ar = round(width / height, 2)
+        return {"width": width, "height": height, "ar": ar}
+    else:
+        return {"width": None, "height": None, "ar": None}
 
 
-def process_file(
-    file_data: dict,
-    images_folder: Optional[Path] = None,
-    ignore_keys: Optional[set] = None,
-    image_path_key: str = "filename",
-) -> dict:
-    ignore_keys = ignore_keys or set()
-    ignore_keys.add("item")
-
-    for key in ignore_keys:
-        file_data.pop(key, None)
-
-    if "image_width" not in file_data or "image_height" not in file_data:
-        if image_path_key not in file_data:
-            raise ValueError(
-                f"Image path key {image_path_key} not found in {file_data} and image dimensions are not available"
-            )
-        if images_folder is None:
-            raise ValueError("Images folder not provided and image dimensions are not available")
-
-        abs_image_path = images_folder / file_data[image_path_key]
-        width, height = get_image_dimensions(abs_image_path)
-        file_data["image_width"] = width
-        file_data["image_height"] = height
-
-    return file_data
-
-
-def process_data_in_batches(
-    data_list: list[dict],
-    images_folder: Optional[Path] = None,
-    image_path_key: str = "filename",
-    batch_size: int = 1000,
-    show_progress: bool = True,
-    ignore_keys: Optional[set] = None,
-    max_workers: int = 16,
-) -> Generator[pl.DataFrame, None, None]:
-    total_files = len(data_list)
-    if batch_size > total_files:
-        batch_size = total_files
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for i in tqdm(range(0, total_files, batch_size), desc="Processing batches", disable=not show_progress):
-            batch_data = data_list[i : i + batch_size]
-            futures = [
-                executor.submit(process_file, item_data, images_folder, ignore_keys, image_path_key)
-                for item_data in batch_data
-            ]
-            data = [future.result() for future in as_completed(futures) if future.result()]
-            if data:
-                try:
-                    df = pl.DataFrame(data, infer_schema_length=None)
-                    # Ensure all dataframes have the same columns
-                    df = df.select(sorted(df.columns))
-                    yield df
-                except Exception as e:
-                    print(f"Error processing {data[0]}: {e}")
-                    raise e
-
-
-def create_global_polars(opts: argparse.Namespace) -> None:
-    json_files = read_files(
-        input_folder=opts.input_folder,
-        output_file=opts.output_file,
-        skip_existing=opts.skip_existing,
+def create_global_polars(
+    s3_fs: Optional[s3fs.S3FileSystem],
+    s3_storage_options: Optional[dict],
+    opts: argparse.Namespace,
+) -> None:
+    # Read files from S3 or local folder
+    df = read_dataframe_from_parquet_files(
+        ds_folder=opts.input_folder,
+        s3_fs=s3_fs,
+        s3_storage_options=s3_storage_options,
+        max_items=opts.max_items if opts.max_items is not None else None,
     )
 
-    # Read all JSON files
-    total_data = []
-    for json_path in tqdm(json_files, desc="Reading JSON files", total=len(json_files)):
-        images_folder = json_path.parent / json_path.stem.split(".")[0]
-        if not images_folder.exists():
-            raise FileNotFoundError(f"Images folder {images_folder} does not exist")
+    # # Skip existing files not to be processed
+    # if opts.skip_existing:
+    #     if "s3://" in opts.output_path:
+    #         if s3_fs.exists(opts.output_path):
+    #             orig_df = pl.read_ipc(opts.output_path, storage_options=s3_storage_options)
+    #         else:
+    #             orig_df = None
+    #     else:
+    #         if Path(opts.output_path).exists():
+    #             orig_df = pl.read_ipc(opts.output_path)
+    #         else:
+    #             orig_df = None
 
-        with open(json_path, "r") as f:
-            json_data = orjson.loads(f.read())
+    #     if orig_df is not None and len(orig_df) > 0 and opts.image_path_column in orig_df.columns:
+    #         df = df.filter(~pl.col(opts.image_path_column).is_in(orig_df[opts.image_path_column]))
 
-        # Convert into list
-        json_data = list(json_data.values())
-
-        # Add images folder to each item
-        for item in json_data:
-            if opts.image_path_key not in item:
-                raise ValueError(f"Image path key {opts.image_path_key} not found in {item}")
-            item[opts.image_path_key] = str(images_folder / item[opts.image_path_key])
-
-            # Rename width and height to image_width and image_height
-            item["image_width"] = item.pop("width")
-            item["image_height"] = item.pop("height")
-
-        # Add to total data
-        total_data.extend(json_data)
-
-    if opts.max_items is not None and len(total_data) > opts.max_items:
-        total_data = random.sample(total_data, opts.max_items)
-
-    batches = process_data_in_batches(
-        data_list=total_data,
-        images_folder=images_folder,
-        image_path_key=opts.image_path_key,
-        batch_size=opts.batch_size,
-        show_progress=True,
-        ignore_keys=set(opts.ignore_keys),
-        max_workers=opts.max_workers,
+    # Rename key column to item_id
+    df = df.rename(
+        {
+            "key": "item_id",
+            "width": "image_width",
+            "height": "image_height",
+        }
     )
 
-    # Create a Polars DataFrame
-    try:
-        df = pl.concat(batches)
-    except Exception as e:
-        print(f"Error concatenating batches: {e}")
-        raise e
+    # Add parquet_id column
+    df = df.with_columns(
+        pl.col("item_id").cast(pl.Utf8).str.slice(0, 5).alias("parquet_id"),
+    )
+    # Concatenate "parquet_id" and "item_id" into a new column opts.image_path_column
+    df = df.with_columns(
+        (pl.col("parquet_id") + "/" + pl.col("item_id") + opts.image_extension).alias(opts.image_path_column)
+    )
+
+    # Get image width, height and aspect ratio using a single map_elements call
+    df = df.with_columns(
+        pl.col(opts.image_path_column)
+        .map_elements(
+            lambda x: get_image_dimensions(x, opts.input_folder, s3_fs),
+            return_dtype=pl.Struct(
+                [
+                    pl.Field("width", pl.Int64),
+                    pl.Field("height", pl.Int64),
+                    pl.Field("ar", pl.Float64),
+                ]
+            ),
+        )
+        .alias("image_dimensions")
+    ).unnest("image_dimensions")
 
     # Write the DataFrame to a feather file
     try:
-        safe_write_ipc(df, opts.output_file)
-        print(f"Global Polars feather file created: {opts.output_file}")
+        safe_write_ipc(
+            df,
+            dest_path=opts.output_path,
+            s3_fs=s3_fs,
+        )
+        print(f"Global Polars feather file created: {opts.output_path}")
     except Exception as e:
-        print(f"Error writing to {opts.output_file}: {e}")
+        print(f"Error writing to {opts.output_path}: {e}")
         raise e
 
 
 def main() -> None:
     opts = parse_args()
-    opts = validate_args(opts)
-    create_global_polars(opts)
+
+    # Get OVH S3 filesystem
+    if "s3://" in opts.input_folder or "s3://" in opts.output_path:
+        s3_fs, s3_storage_options = get_ovh_s3_filesystem(opts)
+    else:
+        s3_fs, s3_storage_options = None, None
+
+    # Validate arguments
+    opts = validate_args(opts=opts)
+
+    # Create global polars file
+    create_global_polars(s3_fs, s3_storage_options, opts)
 
 
 if __name__ == "__main__":

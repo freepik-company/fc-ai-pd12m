@@ -8,11 +8,16 @@ keywords = ['python']
 license = { file = "LICENSE" }
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    "polars",
+    "polars>=1.13.0",
     "boto3",
     "fsspec",
-    "s3fs",
+    "s3fs>=2024.10.0",
     "python-dotenv",
+    "orjson",
+    "tqdm",
+    "pillow",
+    "pyarrow",
+    "pandas",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +48,10 @@ requires = [
     "torch",
 ]
 build-backend = "setuptools.build_meta"
+
+[tool.uv]
+keyring-provider = "subprocess"
+extra-index-url = ["https://oauth2accesstoken@europe-west1-python.pkg.dev/fc-shared/python/simple/"]
 
 [tool.ruff]
 line-length = 120
