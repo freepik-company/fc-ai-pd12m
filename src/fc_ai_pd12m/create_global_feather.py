@@ -1,5 +1,7 @@
 import argparse
-import math
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -7,8 +9,12 @@ import boto3
 import polars as pl
 import s3fs
 from PIL import Image
+from tqdm import tqdm
 
 from fc_ai_pd12m.utils import safe_write_ipc
+
+# To avoid "Image has too many pixels" error
+Image.MAX_IMAGE_PIXELS = None
 
 
 def parse_args():
@@ -40,18 +46,25 @@ def parse_args():
         default=".jpg",
         help="Image extension. Please include the dot",
     )
-
-    # Processing arguments
-    # parser.add_argument(
-    #     "--skip_existing",
-    #     action="store_true",
-    #     help="Skip existing files",
-    # )
+    parser.add_argument(
+        "--max_files",
+        type=int,
+        default=None,
+        help="Maximum number of parquet files to process",
+    )
     parser.add_argument(
         "--max_items",
         type=int,
         default=None,
-        help="Maximum number of items to process",
+        help="Maximum number of items to process per parquet file",
+    )
+
+    # Parallelism arguments
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=16,
+        help="Number of workers to process parquet files in parallel",
     )
 
     # S3 arguments
@@ -95,9 +108,9 @@ def validate_args(opts: argparse.Namespace) -> argparse.Namespace:
     if Path(opts.output_path).suffix.lower() not in [".feather", ".fth"]:
         raise ValueError(f"Output file {opts.output_path} must have a .feather or .fth extension")
 
-    # Check that max items is greater than 0
-    if opts.max_items is not None and opts.max_items < 1:
-        raise ValueError(f"Max items {opts.max_items} must be greater than 0")
+    # Check that max files is greater than 0
+    if opts.max_files is not None and opts.max_files < 1:
+        raise ValueError(f"Max files {opts.max_files} must be greater than 0")
 
     return opts
 
@@ -125,20 +138,14 @@ def get_ovh_s3_filesystem(opts: argparse.Namespace) -> tuple[s3fs.S3FileSystem, 
     return s3, s3_storage_options
 
 
-def w_pbar(pbar, func):
-    def foo(*args, **kwargs):
-        pbar.update(1)
-        return func(*args, **kwargs)
-
-    return foo
-
-
-def read_dataframe_from_parquet_files(
+def get_parquet_files(
     ds_folder: str,
     s3_fs: Optional[s3fs.S3FileSystem],
-    s3_storage_options: Optional[dict],
-    max_items: Optional[int] = None,
-) -> pl.DataFrame:
+) -> list[str]:
+    """
+    Get a list of parquet files from a folder
+    """
+
     # For S3
     if "s3://" in ds_folder:
         if s3_fs is not None:
@@ -153,47 +160,7 @@ def read_dataframe_from_parquet_files(
         raise ValueError(f"No parquet files found in {ds_folder}")
     print(f"Found {len(parquet_files)} parquet files in {ds_folder}")
 
-    # Open first one to get the schema
-    df = pl.read_parquet(parquet_files[0], storage_options=s3_storage_options)
-    df_schema = df.schema
-    parquet_size = df.height
-    del df
-
-    # # To know the total number of rows, open last parquet file and get the number of rows
-    # last_df = pl.read_parquet(parquet_files[-1], storage_options=s3_storage_options)
-    # last_parquet_size = last_df.height
-    # del last_df
-
-    # # Get total number of rows
-    # total_rows = parquet_size * (len(parquet_files) - 1) + last_parquet_size
-
-    # Calculate how many parquet files to read
-    if max_items is not None:
-        num_parquet_files = min(math.ceil(max_items / parquet_size), len(parquet_files))
-    else:
-        num_parquet_files = len(parquet_files)
-
-    # TODO: Randomly select parquet files to read without opening all of them
-    parquet_files_to_read = parquet_files[:num_parquet_files]
-
-    # Read polars
-    df = pl.concat(
-        [
-            pl.read_parquet(
-                file,
-                schema=df_schema,
-                allow_missing_columns=True,
-                storage_options=s3_storage_options,
-            )
-            for file in parquet_files_to_read
-        ]
-    )
-
-    # If max items is set, slice the dataframe
-    if max_items is not None and len(df) > max_items:
-        df = df.slice(0, max_items)
-
-    return df
+    return parquet_files
 
 
 def get_image_path_from_id(
@@ -204,21 +171,9 @@ def get_image_path_from_id(
     return f"{ds_folder}/{item_id[:5]}/{item_id}{image_extension}"
 
 
-def get_image_dimensions(image_path: str, image_folder: str, s3_fs: Optional[s3fs.S3FileSystem]) -> dict:
-    """
-    Get image dimensions and aspect ratio
-
-    Args:
-        image_path (str): Path to the image
-        image_folder (str): Folder containing the images
-        s3_fs (s3fs.S3FileSystem): S3 filesystem
-
-    Returns:
-        dict: Image width, image height, and aspect ratio
-    """
-
+def get_image_dimensions(image_path: str, image_folder: str, s3_fs: Optional[s3fs.S3FileSystem]) -> Optional[dict]:
     if image_path is None:
-        return {"width": None, "height": None, "ar": None}
+        return None
 
     abs_image_path = f"{image_folder}/{image_path}"
     img = None
@@ -231,14 +186,77 @@ def get_image_dimensions(image_path: str, image_folder: str, s3_fs: Optional[s3f
             img = Image.open(abs_image_path)
     except Exception as e:
         print(f"Error getting image dimensions for {image_path}: {e}")
-        return {"width": None, "height": None, "ar": None}
+        return None
 
     if img is not None:
         width, height = img.width, img.height
         ar = round(width / height, 2)
         return {"width": width, "height": height, "ar": ar}
     else:
-        return {"width": None, "height": None, "ar": None}
+        return None
+
+
+def process_parquet(
+    parquet_file: str,
+    s3_fs: Optional[s3fs.S3FileSystem],
+    s3_storage_options: Optional[dict],
+    opts: argparse.Namespace,
+) -> pl.DataFrame:
+    """
+    Process a single parquet file
+    """
+
+    def _get_image_path(item_id: str, image_extension: str = ".jpg") -> str:
+        return f"{item_id[:5]}/{item_id}{image_extension}"
+
+    # Read parquet file
+    df = pl.read_parquet(parquet_file, storage_options=s3_storage_options)
+    pd_df = df.to_pandas()
+
+    if opts.max_items is not None and len(pd_df) > opts.max_items:
+        pd_df = pd_df.sample(opts.max_items)
+
+    # Rename columns
+    pd_df = pd_df.rename(
+        columns={
+            "key": "item_id",
+            "width": "image_width",
+            "height": "image_height",
+        }
+    )
+
+    # Get image path
+    pd_df["image_path"] = pd_df.apply(lambda row: _get_image_path(row["item_id"]), axis=1)
+    image_paths = pd_df["image_path"].tolist()
+
+    # Process image dimensions in parallel
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=opts.num_workers) as executor:
+        futures = [
+            executor.submit(get_image_dimensions, image_path, opts.input_folder, s3_fs) for image_path in image_paths
+        ]
+        image_dimensions = []
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
+            if future.result():
+                image_dimensions.append(future.result())
+
+    elapsed_time = time.time() - start_time
+    avg_time_per_image = elapsed_time / len(image_dimensions)
+    print(
+        f"Processed {parquet_file} in {elapsed_time:.2f} seconds. Average time per image: {avg_time_per_image:.2f} seconds"
+    )
+
+    # Add dimensions to dataframe
+    pd_df["dimensions"] = image_dimensions
+    pd_df = pd_df.dropna(subset=["dimensions"])
+
+    pd_df["image_width"] = pd_df["dimensions"].apply(lambda x: x["width"] if x else None)
+    pd_df["image_height"] = pd_df["dimensions"].apply(lambda x: x["height"] if x else None)
+    pd_df["aspect_ratio"] = pd_df["dimensions"].apply(lambda x: x["ar"] if x else None)
+    pd_df = pd_df.drop("dimensions", axis=1)
+
+    # Convert back to polars
+    return pl.from_pandas(pd_df)
 
 
 def create_global_polars(
@@ -247,62 +265,28 @@ def create_global_polars(
     opts: argparse.Namespace,
 ) -> None:
     # Read files from S3 or local folder
-    df = read_dataframe_from_parquet_files(
+    print(f"Reading parquet files from {opts.input_folder}")
+    parquet_files = get_parquet_files(
         ds_folder=opts.input_folder,
         s3_fs=s3_fs,
-        s3_storage_options=s3_storage_options,
-        max_items=opts.max_items if opts.max_items is not None else None,
     )
+    print(f"Found {len(parquet_files)} parquet files")
 
-    # # Skip existing files not to be processed
-    # if opts.skip_existing:
-    #     if "s3://" in opts.output_path:
-    #         if s3_fs.exists(opts.output_path):
-    #             orig_df = pl.read_ipc(opts.output_path, storage_options=s3_storage_options)
-    #         else:
-    #             orig_df = None
-    #     else:
-    #         if Path(opts.output_path).exists():
-    #             orig_df = pl.read_ipc(opts.output_path)
-    #         else:
-    #             orig_df = None
+    # Calculate how many parquet files to read
+    parquet_size = pl.read_parquet(parquet_files[0], storage_options=s3_storage_options).height
+    print(f"Average rows per parquet file: {parquet_size}")
 
-    #     if orig_df is not None and len(orig_df) > 0 and opts.image_path_column in orig_df.columns:
-    #         df = df.filter(~pl.col(opts.image_path_column).is_in(orig_df[opts.image_path_column]))
+    if opts.max_files is not None and len(parquet_files) > opts.max_files:
+        parquet_files = random.sample(parquet_files, opts.max_files)
+        print(f"Processing {len(parquet_files)} parquet files")
 
-    # Rename key column to item_id
-    df = df.rename(
-        {
-            "key": "item_id",
-            "width": "image_width",
-            "height": "image_height",
-        }
-    )
-
-    # Add parquet_id column
-    df = df.with_columns(
-        pl.col("item_id").cast(pl.Utf8).str.slice(0, 5).alias("parquet_id"),
-    )
-    # Concatenate "parquet_id" and "item_id" into a new column opts.image_path_column
-    df = df.with_columns(
-        (pl.col("parquet_id") + "/" + pl.col("item_id") + opts.image_extension).alias(opts.image_path_column)
-    )
-
-    # Get image width, height and aspect ratio using a single map_elements call
-    df = df.with_columns(
-        pl.col(opts.image_path_column)
-        .map_elements(
-            lambda x: get_image_dimensions(x, opts.input_folder, s3_fs),
-            return_dtype=pl.Struct(
-                [
-                    pl.Field("width", pl.Int64),
-                    pl.Field("height", pl.Int64),
-                    pl.Field("ar", pl.Float64),
-                ]
-            ),
-        )
-        .alias("image_dimensions")
-    ).unnest("image_dimensions")
+    # Process parquet files
+    total_df = pl.DataFrame()
+    for parquet_file in parquet_files:
+        df = process_parquet(parquet_file, s3_fs, s3_storage_options, opts)
+        if len(df) > 0:
+            total_df = pl.concat([total_df, df])
+    print(f"Total rows: {total_df.height}")
 
     # Write the DataFrame to a feather file
     try:
@@ -330,7 +314,10 @@ def main() -> None:
     opts = validate_args(opts=opts)
 
     # Create global polars file
+    tic = time.time()
     create_global_polars(s3_fs, s3_storage_options, opts)
+    toc = time.time()
+    print(f"Total time: {toc - tic:.2f} seconds")
 
 
 if __name__ == "__main__":
