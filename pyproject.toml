@@ -18,6 +18,7 @@ dependencies = [
     "pillow",
     "pyarrow",
     "pandas",
+    "huggingface_hub[cli]",
 ]
 
 [project.optional-dependencies]

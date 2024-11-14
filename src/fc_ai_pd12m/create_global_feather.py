@@ -27,10 +27,10 @@ def parse_args():
         help="Path to the input folder containing parquet files. It can be a local path or a S3 path. If it is a S3 path, include s3:// and the bucket name on it",
     )
     parser.add_argument(
-        "--output_path",
+        "--output_folder",
         type=str,
-        default="global_pd12m_data.feather",
-        help="Path to the output feather file. It can be a local path or a S3 path. If it is a S3 path, include s3:// and the bucket name on it",
+        default="output/PD12M",
+        help="Path to the output folder. It can be a local path or a S3 path. If it is a S3 path, include s3:// and the bucket name on it",
     )
 
     # Image arguments
@@ -95,18 +95,20 @@ def validate_args(opts: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"Input folder {opts.input_folder} does not exist")
 
     # Check that output file parent folder exists
-    if "s3://" in opts.output_path:
+    if "s3://" in opts.output_folder:
         # TODO: fs.exists check fails with directories
-        # if not s3_fs.exists(Path(opts.output_path).parent):
-        #     raise ValueError(f"Output folder {Path(opts.output_path).parent} does not exist")
+        # if not s3_fs.exists(Path(opts.output_folder).parent):
+        #     raise ValueError(f"Output folder {Path(opts.output_folder).parent} does not exist")
         pass
     else:
-        if not Path(opts.output_path).parent.exists():
-            Path(opts.output_path).parent.mkdir(parents=True, exist_ok=True)
+        if not Path(opts.output_folder).parent.exists():
+            Path(opts.output_folder).parent.mkdir(parents=True, exist_ok=True)
 
-    # Check that output file has a valid extension
-    if Path(opts.output_path).suffix.lower() not in [".feather", ".fth"]:
-        raise ValueError(f"Output file {opts.output_path} must have a .feather or .fth extension")
+    # Remove trailing slashes
+    if "/" in opts.input_folder:
+        opts.input_folder = opts.input_folder.rstrip("/")
+    if "/" in opts.output_folder:
+        opts.output_folder = opts.output_folder.rstrip("/")
 
     # Check that max files is greater than 0
     if opts.max_files is not None and opts.max_files < 1:
@@ -140,7 +142,8 @@ def get_ovh_s3_filesystem(opts: argparse.Namespace) -> tuple[s3fs.S3FileSystem, 
 
 def get_parquet_files(
     ds_folder: str,
-    s3_fs: Optional[s3fs.S3FileSystem],
+    output_folder: str,
+    s3_fs: Optional[s3fs.S3FileSystem] = None,
 ) -> list[str]:
     """
     Get a list of parquet files from a folder
@@ -150,6 +153,7 @@ def get_parquet_files(
     if "s3://" in ds_folder:
         if s3_fs is not None:
             parquet_files = list(s3_fs.glob(ds_folder + "/*.parquet"))
+            # Add s3:// prefix only if file exists
             parquet_files = [f"s3://{file}" for file in parquet_files if s3_fs.exists(file)]
         else:
             raise ValueError("s3_fs is None, but an S3 path was provided.")
@@ -160,7 +164,20 @@ def get_parquet_files(
         raise ValueError(f"No parquet files found in {ds_folder}")
     print(f"Found {len(parquet_files)} parquet files in {ds_folder}")
 
-    return parquet_files
+    # If feather file exists, means that the parquet file has already been processed
+    non_processed_parquet_files = []
+    for parquet_file in parquet_files:
+        feather_file = f"{output_folder}/{Path(parquet_file).stem}.feather"
+        if "s3://" in feather_file:
+            if s3_fs is not None and not s3_fs.exists(feather_file):
+                non_processed_parquet_files.append(parquet_file)
+        else:
+            if not Path(feather_file).exists():
+                non_processed_parquet_files.append(parquet_file)
+    if len(non_processed_parquet_files) == 0:
+        raise ValueError("All parquet files have already been processed")
+
+    return non_processed_parquet_files
 
 
 def get_image_path_from_id(
@@ -217,40 +234,51 @@ def process_parquet(
         pd_df = pd_df.sample(opts.max_items)
 
     # Rename columns
-    pd_df = pd_df.rename(
-        columns={
-            "key": "item_id",
-            "width": "image_width",
-            "height": "image_height",
-        }
-    )
+    old_cols_to_replace = ["key", "width", "height"]
+    new_cols_to_replace = ["item_id", "image_width", "image_height"]
+    for old_col, new_col in zip(old_cols_to_replace, new_cols_to_replace, strict=False):
+        if new_col not in pd_df.columns:
+            pd_df = pd_df.rename(columns={old_col: new_col})
 
     # Get image path
-    pd_df["image_path"] = pd_df.apply(lambda row: _get_image_path(row["item_id"]), axis=1)
-    image_paths = pd_df["image_path"].tolist()
+    if "image_path" not in pd_df.columns:
+        pd_df["image_path"] = pd_df.apply(lambda row: _get_image_path(row["item_id"]), axis=1)
+
+    # Find which rows have image_width or image_height are None
+    target_df = pd_df[pd_df["image_width"].isna() | pd_df["image_height"].isna()]
+    if len(target_df) == 0:
+        return pl.from_pandas(pd_df), 0.0
+
+    # Get image paths
+    target_image_paths = target_df["image_path"].tolist()
 
     # Process image dimensions in parallel
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=opts.num_workers) as executor:
         futures = [
-            executor.submit(get_image_dimensions, image_path, opts.input_folder, s3_fs) for image_path in image_paths
+            executor.submit(get_image_dimensions, image_path, opts.input_folder, s3_fs)
+            for image_path in target_image_paths
         ]
         image_dimensions = []
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images", position=1, leave=True):
             if future.result():
                 image_dimensions.append(future.result())
 
+    # Calculate average time per image
     elapsed_time = time.time() - start_time
     avg_time_per_image = elapsed_time / len(image_dimensions)
 
     # Add dimensions to dataframe
-    pd_df["dimensions"] = image_dimensions
-    pd_df = pd_df.dropna(subset=["dimensions"])
+    target_df["dimensions"] = image_dimensions
+    target_df = target_df.dropna(subset=["dimensions"])
 
-    pd_df["image_width"] = pd_df["dimensions"].apply(lambda x: x["width"] if x else None)
-    pd_df["image_height"] = pd_df["dimensions"].apply(lambda x: x["height"] if x else None)
-    pd_df["aspect_ratio"] = pd_df["dimensions"].apply(lambda x: x["ar"] if x else None)
-    pd_df = pd_df.drop("dimensions", axis=1)
+    target_df["image_width"] = target_df["dimensions"].apply(lambda x: x["width"] if x else None)
+    target_df["image_height"] = target_df["dimensions"].apply(lambda x: x["height"] if x else None)
+    target_df["aspect_ratio"] = target_df["dimensions"].apply(lambda x: x["ar"] if x else None)
+    target_df = target_df.drop("dimensions", axis=1)
+
+    # Substitute target_df rows in pd_df
+    pd_df.update(target_df)
 
     # Convert back to polars
     return pl.from_pandas(pd_df), avg_time_per_image
@@ -265,6 +293,7 @@ def create_global_polars(
     print(f"Reading parquet files from {opts.input_folder}")
     parquet_files = get_parquet_files(
         ds_folder=opts.input_folder,
+        output_folder=opts.output_folder,
         s3_fs=s3_fs,
     )
     print(f"Found {len(parquet_files)} parquet files")
@@ -290,18 +319,29 @@ def create_global_polars(
         df, avg_time_per_image = process_parquet(parquet_file, s3_fs, s3_storage_options, opts)
         if len(df) > 0:
             total_df = pl.concat([total_df, df])
-        pbar.set_description(f"Processing parquet files (avg time/img: {avg_time_per_image:.3f}s)")
+
+            if avg_time_per_image > 0:
+                pbar.set_description(f"Processing parquet files (avg time/img: {avg_time_per_image:.3f}s)")
+
+            # Save processed parquet file to S3 only if max_items is not set
+            if opts.max_items is None:
+                dest_path = f"{opts.output_folder}/{Path(parquet_file).stem}.feather"
+                try:
+                    safe_write_ipc(df, dest_path, s3_fs)
+                except Exception as e:
+                    print(f"Error writing to {dest_path}: {e}")
 
     # Write the DataFrame to a feather file
+    dest_path = f"{opts.output_folder}/global_pd12m_data.feather"
     try:
         safe_write_ipc(
             df,
-            dest_path=opts.output_path,
+            dest_path=dest_path,
             s3_fs=s3_fs,
         )
-        print(f"Global Polars feather file created: {opts.output_path}")
+        print(f"Global Polars feather file created: {dest_path}")
     except Exception as e:
-        print(f"Error writing to {opts.output_path}: {e}")
+        print(f"Error writing to {dest_path}: {e}")
         raise e
 
 
@@ -309,7 +349,7 @@ def main() -> None:
     opts = parse_args()
 
     # Get OVH S3 filesystem
-    if "s3://" in opts.input_folder or "s3://" in opts.output_path:
+    if "s3://" in opts.input_folder or "s3://" in opts.output_folder:
         s3_fs, s3_storage_options = get_ovh_s3_filesystem(opts)
     else:
         s3_fs, s3_storage_options = None, None

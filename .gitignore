@@ -2,6 +2,7 @@
 
 # Folder
 output/
+data/
 
 # S3 credentials
 .aws/
