@@ -19,6 +19,7 @@ dependencies = [
     "pyarrow",
     "pandas",
     "huggingface_hub[cli]",
+    "fc-ai-data-tools",
 ]
 
 [project.optional-dependencies]
